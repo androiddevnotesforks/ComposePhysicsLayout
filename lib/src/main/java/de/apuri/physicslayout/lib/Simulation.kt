@@ -1,6 +1,5 @@
 package de.apuri.physicslayout.lib
 
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
@@ -10,21 +9,38 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import de.apuri.physicslayout.lib.body.ApplyBodySyncResult
+import de.apuri.physicslayout.lib.body.Body
+import de.apuri.physicslayout.lib.body.BodyManager
+import de.apuri.physicslayout.lib.body.DefaultApplyBodySyncResult
+import de.apuri.physicslayout.lib.body.LayoutBodySyncManager
+import de.apuri.physicslayout.lib.border.ApplyNewWorldBorder
+import de.apuri.physicslayout.lib.border.DefaultApplyNewWorldBorder
+import de.apuri.physicslayout.lib.border.LayoutShape
+import de.apuri.physicslayout.lib.border.toWorldShape
+import de.apuri.physicslayout.lib.drag.DefaultDragDelegate
+import de.apuri.physicslayout.lib.drag.DragConfig
+import de.apuri.physicslayout.lib.drag.DragDelegate
+import de.apuri.physicslayout.lib.drag.TouchEvent
+import de.apuri.physicslayout.lib.drag.toWorldTouchEvent
+import de.apuri.physicslayout.lib.shape.WorldShape
+import de.apuri.physicslayout.lib.shape.toWorldBodies
 import kotlinx.coroutines.delay
-import org.dyn4j.dynamics.Body
-import org.dyn4j.geometry.MassType
 import org.dyn4j.geometry.Vector2
 import org.dyn4j.world.World
 
 class Simulation internal constructor(
-    private val scale: Double,
+    internal val scale: Double,
     private val world: World<Body>,
-    private val density: Density,
+    internal val density: Density,
 ) {
-    internal val transformations = mutableStateMapOf<String, Transformation>()
+    internal val transformations = mutableStateMapOf<String, LayoutTransformation>()
+
     private val dragDelegate: DragDelegate = DefaultDragDelegate(world)
+    private val bodyManager: BodyManager = BodyManager(world)
+    private val applyBodySyncResult: ApplyBodySyncResult = DefaultApplyBodySyncResult(bodyManager)
+    private val applyNewWorldBorder: ApplyNewWorldBorder = DefaultApplyNewWorldBorder(world)
 
     fun setGravity(offset: Offset) {
         world.gravity = offset.toVector2()
@@ -39,111 +55,43 @@ class Simulation internal constructor(
 
             world.update(elapsed)
 
-            world.bodies.filter {
-                it.userData is BodyMetaData
-            }.associate {
-                (it.userData as BodyMetaData).id to it.toTransformation()
-            }.also {
-                transformations.putAll(it)
-            }
+            updateTransformations()
 
             delay(1)
         }
     }
 
-    internal fun updateWorldSize(intSize: IntSize) {
-        world.updateWorldSize(
-            intSize.width / scale,
-            intSize.height / scale,
-        )
+    private fun updateTransformations() {
+        bodyManager.bodies.mapValues {
+            it.value.toLayoutTransformation()
+        }.also {
+            transformations.putAll(it)
+        }
     }
 
-    internal fun syncBodies(layoutItems: List<LayoutItem>) {
-        removeBodiesWithIdNotIn(layoutItems.map { it.id })
-        layoutItems.forEach {
-            val bodyMetaData = it.toBodyMetaData()
-            val body = world.findBodyById(bodyMetaData.id)
-            if (body == null) {
-                createBody(bodyMetaData, it).also { newBody ->
-                    world.addBody(newBody)
-                    transformations[bodyMetaData.id] = newBody.toTransformation()
-                }
-            } else {
-                updateBody(body, bodyMetaData)
-            }
-        }
+    internal fun applyBodySyncResult(syncResult: LayoutBodySyncManager.SyncResult) {
+        applyBodySyncResult(
+            added = syncResult.added.toWorldBodies(),
+            removed = syncResult.removed.toWorldBodies(),
+            updated = syncResult.updated.toWorldBodies()
+        )
+
+        updateTransformations()
+    }
+
+    internal fun applyNewWorldBorder(layoutShape: LayoutShape) {
+        applyNewWorldBorder(layoutShape.toWorldShape())
     }
 
     internal fun drag(bodyId: String, touchEvent: TouchEvent, dragConfig: DragConfig.Draggable) {
-        dragDelegate.drag(bodyId, touchEvent.toWorldTouchEvent(), dragConfig)
-    }
-
-    private fun createBody(
-        bodyMetaData: BodyMetaData,
-        layoutItem: LayoutItem,
-    ) = Body().apply {
-        angularDamping = 0.7
-        isAtRestDetectionEnabled = false
-        userData = bodyMetaData
-        applyFixtures(bodyMetaData)
-        setMass(if (layoutItem.isStatic) MassType.INFINITE else MassType.NORMAL)
-        translate(
-            Vector2(
-                layoutItem.initialTranslation.x / scale,
-                layoutItem.initialTranslation.y / scale
+        bodyManager.bodies[bodyId]?.let {
+            dragDelegate.drag(
+                body = it,
+                touchEvent = touchEvent.toWorldTouchEvent(),
+                dragConfig = dragConfig
             )
-        )
-        applyImpulse(layoutItem.initialImpulse.toVector2())
-    }
-
-    private fun updateBody(
-        body: Body,
-        newBodyMetaData: BodyMetaData
-    ) = body.apply {
-        val currentMetaData = userData as BodyMetaData
-        if (currentMetaData == newBodyMetaData) return@apply
-
-        userData = newBodyMetaData
-        removeAllFixtures()
-        applyFixtures(newBodyMetaData)
-        setMass(if (newBodyMetaData.isStatic) MassType.INFINITE else MassType.NORMAL)
-        updateMass()
-    }
-
-    private fun Body.applyFixtures(bodyMetaData: BodyMetaData) {
-        createFixtures(bodyMetaData, density, scale).forEach {
-            addFixture(it, 1.0, 0.2, 0.4)
         }
     }
-
-    private fun Body.toTransformation() = Transformation(
-        translationX = (transform.translationX * scale).toFloat(),
-        translationY = (transform.translationY * scale).toFloat(),
-        rotation = transform.rotation.toDegrees().toFloat(),
-    )
-
-    private fun removeBodiesWithIdNotIn(currentIds: List<String>) {
-        val removedBodyIds = world.removeBodiesWithIdNotIn(currentIds)
-        removedBodyIds.forEach {
-            transformations.remove(it)
-        }
-    }
-
-    private fun LayoutItem.toBodyMetaData() = BodyMetaData(
-        id = id,
-        width = width / scale,
-        height = height / scale,
-        shape = shape,
-        isStatic = isStatic
-    )
-
-    private fun Offset.toVector2() = Vector2(x.toDouble(), y.toDouble())
-    private fun Offset.toWorldVector2() = Vector2(x.toDouble(), y.toDouble()).divide(scale)
-    private fun TouchEvent.toWorldTouchEvent() = WorldTouchEvent(
-        pointerId = pointerId,
-        localOffset = localOffset.toWorldVector2(),
-        type = type
-    )
 }
 
 @Composable
@@ -164,41 +112,17 @@ fun rememberSimulation(
     return simulation
 }
 
-data class WorldMetaData(
-    val width: Double = 0.0,
-    val height: Double = 0.0,
-)
-
-data class BodyMetaData(
+internal data class WorldBody(
     val id: String,
     val width: Double,
     val height: Double,
-    val shape: RoundedCornerShape,
-    val isStatic: Boolean
-)
-
-data class LayoutItem(
-    val id: String,
-    val width: Int,
-    val height: Int,
-    val shape: RoundedCornerShape,
+    val shape: WorldShape,
     val isStatic: Boolean,
-    val initialTranslation: Offset,
-    val initialImpulse: Offset,
-)
-
-internal enum class WorldBorder {
-    TOP, BOTTOM, LEFT, RIGHT
-}
-
-data class WorldTouchEvent(
-    val pointerId: Long,
-    val localOffset: Vector2,
-    val type: TouchType
+    val initialTranslation: Vector2
 )
 
 @Immutable
-internal data class Transformation(
+internal data class LayoutTransformation(
     val translationX: Float,
     val translationY: Float,
     val rotation: Float,
@@ -208,12 +132,7 @@ private val DEFAULT_SCALE = 64.dp
 
 private const val EARTH_GRAVITY = 9.81
 
-private val DEFAULT_WORLD = World<Body>().apply {
+private val DEFAULT_WORLD get() = World<Body>().apply {
     gravity = Vector2(0.0, EARTH_GRAVITY)
-    userData = WorldMetaData()
     settings.stepFrequency = 1.0 / 90
-    addBody(Body().apply { userData = WorldBorder.TOP })
-    addBody(Body().apply { userData = WorldBorder.BOTTOM })
-    addBody(Body().apply { userData = WorldBorder.LEFT })
-    addBody(Body().apply { userData = WorldBorder.RIGHT })
 }
